@@ -32,15 +32,22 @@ function validateAssetBalanceOfAbi(abi, params) {
 
 function createApi(block, responses) {
   const calls = []
+  const fixtureLookups = []
   const balances = {}
   return {
     block,
     calls,
+    fixtureLookups,
     balances,
     async call(request) {
       calls.push({ block: this.block, ...request })
-      const response = responses[callKey(request)]
-      assert.notEqual(response, undefined, `unexpected call: ${callKey(request)}`)
+      if (request.target.toLowerCase() === I_SUSD.toLowerCase() && request.abi.includes('assetBalanceOf'))
+        validateAssetBalanceOfAbi(request.abi, request.params ?? [])
+
+      const key = callKey(request)
+      fixtureLookups.push(key)
+      const response = responses[key]
+      assert.notEqual(response, undefined, `unexpected call: ${key}`)
       return response
     },
     add(token, amount) {
@@ -61,12 +68,29 @@ function responses({ kDocBalance, kDocRate, kUsdrifBalance, kUsdrifRate, sovrynT
   }
 }
 
-test('requires the Sovryn handler in the assetBalanceOf ABI', () => {
-  const zeroInputShorthand = 'uint256:assetBalanceOf'
-  const completeSignature = 'function assetBalanceOf(address) view returns (uint256)'
+test('strict fake API rejects old Sovryn shorthand and accepts corrected adapter requests', async () => {
+  const oldRequest = {
+    target: I_SUSD,
+    abi: 'uint256:assetBalanceOf',
+    params: [SOVRYN_HANDLER],
+  }
+  const oldAdapter = { rsk: { tvl: api => api.call(oldRequest) } }
+  const oldApi = createApi(9294353, { [callKey(oldRequest)]: 300n })
 
-  assert.throws(() => validateAssetBalanceOfAbi(zeroInputShorthand, [SOVRYN_HANDLER]), /zero ABI inputs/)
-  assert.doesNotThrow(() => validateAssetBalanceOfAbi(completeSignature, [SOVRYN_HANDLER]))
+  await assert.rejects(oldAdapter.rsk.tvl(oldApi), /zero ABI inputs/)
+  assert.deepEqual(oldApi.fixtureLookups, [])
+
+  const correctedApi = createApi(9294353, responses({
+    kDocBalance: 100n,
+    kDocRate: 1000000000000000000n,
+    kUsdrifBalance: 200n,
+    kUsdrifRate: 1000000000000000000n,
+    sovrynToken: DOC,
+    sovrynBalance: 300n,
+  }))
+
+  await assert.doesNotReject(adapter.rsk.tvl(correctedApi))
+  assert.equal(correctedApi.fixtureLookups.length, 6)
 })
 
 test('calculates both Tropykus underlying balances with integer floors', async () => {
