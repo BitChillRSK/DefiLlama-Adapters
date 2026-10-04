@@ -32,7 +32,7 @@ async function tvl(api) {
     if (protocol === 'sovryn') {
       const [loanToken, underlyingBalance] = await Promise.all([
         api.call({ target: lendingToken, abi: 'address:loanTokenAddress' }),
-        api.call({ target: lendingToken, abi: 'uint256:assetBalanceOf', params: [handler] }),
+        api.call({ target: lendingToken, abi: 'function assetBalanceOf(address) view returns (uint256)', params: [handler] }),
       ])
       api.add(loanToken, underlyingBalance)
       return

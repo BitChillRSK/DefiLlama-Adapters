@@ -16,6 +16,20 @@ function callKey({ target, abi, params = [] }) {
   return `${target.toLowerCase()}|${abi}|${params.join(',').toLowerCase()}`
 }
 
+function validateAssetBalanceOfAbi(abi, params) {
+  const completeSignature = /^function assetBalanceOf\(([^)]*)\) view returns \(uint256\)$/.exec(abi)
+  if (!completeSignature) {
+    if (abi === 'uint256:assetBalanceOf' && params.length > 0)
+      throw new TypeError('assetBalanceOf shorthand declares zero ABI inputs')
+    throw new TypeError(`unsupported assetBalanceOf ABI: ${abi}`)
+  }
+
+  const inputTypes = completeSignature[1].split(',').filter(Boolean)
+  assert.deepEqual(inputTypes, ['address'])
+  assert.equal(params.length, inputTypes.length)
+  assert.match(params[0], /^0x[\da-f]{40}$/i)
+}
+
 function createApi(block, responses) {
   const calls = []
   const balances = {}
@@ -43,9 +57,17 @@ function responses({ kDocBalance, kDocRate, kUsdrifBalance, kUsdrifRate, sovrynT
     [callKey({ target: K_USDRIF, abi: 'erc20:balanceOf', params: [USDRIF_HANDLER] })]: kUsdrifBalance,
     [callKey({ target: K_USDRIF, abi: 'uint256:exchangeRateStored' })]: kUsdrifRate,
     [callKey({ target: I_SUSD, abi: 'address:loanTokenAddress' })]: sovrynToken,
-    [callKey({ target: I_SUSD, abi: 'uint256:assetBalanceOf', params: [SOVRYN_HANDLER] })]: sovrynBalance,
+    [callKey({ target: I_SUSD, abi: 'function assetBalanceOf(address) view returns (uint256)', params: [SOVRYN_HANDLER] })]: sovrynBalance,
   }
 }
+
+test('requires the Sovryn handler in the assetBalanceOf ABI', () => {
+  const zeroInputShorthand = 'uint256:assetBalanceOf'
+  const completeSignature = 'function assetBalanceOf(address) view returns (uint256)'
+
+  assert.throws(() => validateAssetBalanceOfAbi(zeroInputShorthand, [SOVRYN_HANDLER]), /zero ABI inputs/)
+  assert.doesNotThrow(() => validateAssetBalanceOfAbi(completeSignature, [SOVRYN_HANDLER]))
+})
 
 test('calculates both Tropykus underlying balances with integer floors', async () => {
   const api = createApi(9200000, responses({
