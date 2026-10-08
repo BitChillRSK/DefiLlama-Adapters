@@ -163,12 +163,12 @@ function validateRelaunchManifest(manifest) {
 
   // A BitChill address must be new: not repeated, not a token, not a lender token, not legacy.
   const taken = new Map()
+  for (const address of LEGACY_ADDRESSES) taken.set(address.toLowerCase(), 'a legacy address')
   for (const [symbol, token] of Object.entries(TOKENS)) {
     taken.set(token.address.toLowerCase(), `token ${symbol}`)
     taken.set(token.layerBankAToken.toLowerCase(), `LayerBank aToken of ${symbol}`)
     if (token.sovrynIToken) taken.set(token.sovrynIToken.toLowerCase(), `Sovryn iToken of ${symbol}`)
   }
-  for (const address of LEGACY_ADDRESSES) taken.set(address.toLowerCase(), 'a legacy address')
   for (const [label, address] of bitchillAddresses) {
     const key = address.toLowerCase()
     if (taken.has(key)) fail(`${label} duplicates ${taken.get(key)}`)
