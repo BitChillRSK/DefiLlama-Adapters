@@ -9,13 +9,19 @@ const {
   TOKENS,
   validateRelaunchManifest,
   createRelaunchTvl,
+  createTvl,
 } = require('./relaunch')
 
 // Fixture addresses only. None of them is a deployed BitChill relaunch contract.
 const fixtureAddress = suffix => `0x${'f1'.repeat(18)}${suffix.toString(16).padStart(4, '0')}`
 const DCA_MANAGER = fixtureAddress(0x0001)
 const OPERATIONS_ADMIN = fixtureAddress(0x0002)
-const POOL = fixtureAddress(0x00aa)
+// One pool per aToken, so a reader that reuses the pool of another token fails.
+const POOLS = {
+  DOC: fixtureAddress(0x00aa),
+  USDRIF: fixtureAddress(0x00ab),
+  USDT0: fixtureAddress(0x00ac),
+}
 const HANDLERS = {
   'DOC:0': fixtureAddress(0x0100),
   'DOC:1': fixtureAddress(0x0101),
@@ -38,6 +44,7 @@ const ABI_SCALED_BALANCE_OF = 'function scaledBalanceOf(address) view returns (u
 const ABI_POOL = 'address:POOL'
 const ABI_NORMALIZED_INCOME = 'function getReserveNormalizedIncome(address) view returns (uint256)'
 const ABI_TOKEN_PRICE = 'uint256:tokenPrice'
+const ABI_GET_HANDLER = 'function getHandler(address token, uint256 routeIndex) view returns (address)'
 
 const RAY = 10n ** 27n
 const WAD = 10n ** 18n
@@ -68,7 +75,7 @@ function callKey({ target, abi, params = [] }) {
 function validateAbi({ abi, params = [] }) {
   if (abi === ABI_BALANCE_OF) return assert.equal(params.length, 1)
   if (/^\w+:\w+$/.test(abi)) return assert.equal(params.length, 0, `${abi} declares zero ABI inputs`)
-  const signature = /^function \w+\(([^)]*)\) view returns \(uint256\)$/.exec(abi)
+  const signature = /^function \w+\(([^)]*)\) view returns \((?:uint256|address)\)$/.exec(abi)
   assert.ok(signature, `unsupported ABI: ${abi}`)
   assert.equal(params.length, signature[1].split(',').filter(Boolean).length)
 }
@@ -78,6 +85,7 @@ function createApi(block, responsesByBlock, { lazyBlock = false } = {}) {
   const api = {
     block: lazyBlock ? undefined : block,
     calls: [],
+    multiCalls: [],
     adds: [],
     balances: {},
     getBlockCalls: 0,
@@ -94,6 +102,19 @@ function createApi(block, responsesByBlock, { lazyBlock = false } = {}) {
       assert.notEqual(response, undefined, `unexpected call at block ${this.block}: ${callKey(request)}`)
       return response
     },
+    // One batched read, as ChainApi.multiCall: one target and ABI, a list of { params }.
+    async multiCall(request) {
+      assert.deepEqual(Object.keys(request).sort(), ['abi', 'calls', 'target'])
+      this.multiCalls.push({ block: this.block, ...request })
+      return request.calls.map(entry => {
+        assert.deepEqual(Object.keys(entry), ['params'])
+        const single = { target: request.target, abi: request.abi, params: entry.params }
+        validateAbi(single)
+        const response = (responsesByBlock[this.block] ?? {})[callKey(single)]
+        assert.notEqual(response, undefined, `unexpected call at block ${this.block}: ${callKey(single)}`)
+        return response
+      })
+    },
     add(token, amount) {
       assert.equal(typeof amount, 'bigint')
       const key = token.toLowerCase()
@@ -104,20 +125,27 @@ function createApi(block, responsesByBlock, { lazyBlock = false } = {}) {
   return api
 }
 
-// Builds the lender and token responses for a custody state.
+const getHandlerKey = pair => {
+  const [symbol, routeIndex] = pair.split(':')
+  return callKey({ target: OPERATIONS_ADMIN, abi: ABI_GET_HANDLER, params: [TOKENS[symbol].address, Number(routeIndex)] })
+}
+
+// Builds the lender, token and OperationsAdmin responses for a custody state.
 // state: { 'DOC:0': cash, 'DOC:1': { scaled, index }, 'DOC:2': { shares, price }, ... }
-function custodyResponses(state) {
+// assigned: what OperationsAdmin.getHandler returns for a pair, when it differs from the manifest.
+function custodyResponses(state, assigned = {}) {
   const responses = {}
   for (const [pair, value] of Object.entries(state)) {
     const [symbol, routeIndex] = pair.split(':')
     const token = TOKENS[symbol]
     const handler = HANDLERS[pair]
+    responses[getHandlerKey(pair)] = assigned[pair] ?? handler
     if (routeIndex === '0') {
       responses[callKey({ target: token.address, abi: ABI_BALANCE_OF, params: [handler] })] = value
     } else if (routeIndex === '1') {
       responses[callKey({ target: token.layerBankAToken, abi: ABI_SCALED_BALANCE_OF, params: [handler] })] = value.scaled
-      responses[callKey({ target: token.layerBankAToken, abi: ABI_POOL })] = POOL
-      responses[callKey({ target: POOL, abi: ABI_NORMALIZED_INCOME, params: [token.address] })] = value.index
+      responses[callKey({ target: token.layerBankAToken, abi: ABI_POOL })] = POOLS[symbol]
+      responses[callKey({ target: POOLS[symbol], abi: ABI_NORMALIZED_INCOME, params: [token.address] })] = value.index
     } else {
       responses[callKey({ target: token.sovrynIToken, abi: ABI_BALANCE_OF, params: [handler] })] = value.shares
       responses[callKey({ target: token.sovrynIToken, abi: ABI_TOKEN_PRICE })] = value.price
@@ -211,6 +239,14 @@ test('a missing manifest gives a reader that never uses the API', async () => {
 
   await createRelaunchTvl(null)(untouchable)
   await createRelaunchTvl(undefined)(untouchable)
+
+  // The composition used by index.js makes the six legacy reads only.
+  const api = createLegacyApi(START_BLOCK + 10, { [START_BLOCK + 10]: LEGACY_RESPONSES })
+  await createTvl(null)(api)
+  assert.equal(api.calls.length, 6)
+  assert.deepEqual(api.multiCalls, [])
+  assert.equal(api.getBlockCalls, 0)
+  assert.deepEqual(api.balances, LEGACY_EXPECTED)
 })
 
 test('lists exactly the seven supported pairs with their decimals', () => {
@@ -261,13 +297,24 @@ test('makes exactly the expected reads and every read uses the supplied block', 
   // idle: 1 read. LayerBank: 3 reads. Sovryn: 2 reads. 3 + 9 + 2 = 14.
   assert.equal(api.calls.length, 14)
   assert.deepEqual(new Set(api.calls.map(call => call.key)), new Set([
-    ...Object.keys(responses).filter(key => !key.includes('|address:POOL|')),
-    callKey({ target: TOKENS.DOC.layerBankAToken, abi: ABI_POOL }),
-    callKey({ target: TOKENS.USDRIF.layerBankAToken, abi: ABI_POOL }),
-    callKey({ target: TOKENS.USDT0.layerBankAToken, abi: ABI_POOL }),
+    ...Object.keys(responses).filter(key => !key.includes(ABI_GET_HANDLER)),
   ]))
   for (const call of api.calls) assert.equal(call.block, block)
   assert.equal(api.getBlockCalls, 0)
+
+  // Each LayerBank index is read from the pool of its own aToken.
+  for (const [symbol, pool] of Object.entries(POOLS)) {
+    const indexReads = api.calls.filter(call => call.abi === ABI_NORMALIZED_INCOME && call.params[0] === TOKENS[symbol].address)
+    assert.deepEqual(indexReads.map(call => call.target), [pool])
+  }
+
+  // One batched OperationsAdmin read checks the seven assignments, at the same block.
+  assert.deepEqual(api.multiCalls, [{
+    block,
+    target: OPERATIONS_ADMIN,
+    abi: ABI_GET_HANDLER,
+    calls: SUPPORTED_PAIRS.map(pair => ({ params: [TOKENS[pair.split(':')[0]].address, Number(pair.split(':')[1])] })),
+  }])
 
   // No handler, DcaManager or OperationsAdmin is a call target: custody is read from tokens and lenders.
   const targets = new Set(api.calls.map(call => call.target.toLowerCase()))
@@ -315,6 +362,7 @@ test('skips every relaunch read before the deployment start block and reads from
     const before = createApi(block, { [block]: responses })
     await relaunchTvl(before)
     assert.deepEqual(before.calls, [])
+    assert.deepEqual(before.multiCalls, [])
     assert.deepEqual(before.adds, [])
     assert.deepEqual(before.balances, {})
   }
@@ -322,6 +370,8 @@ test('skips every relaunch read before the deployment start block and reads from
   const atStart = createApi(START_BLOCK, { [START_BLOCK]: responses })
   await relaunchTvl(atStart)
   assert.equal(atStart.calls.length, 14)
+  assert.equal(atStart.multiCalls.length, 1)
+  assert.equal(atStart.multiCalls[0].block, START_BLOCK)
   assert.deepEqual(atStart.balances, sumByToken(SEVEN_PAIR_EXPECTED))
 })
 
@@ -333,15 +383,68 @@ test('resolves an unset block through the supplied API only', async () => {
   await relaunchTvl(early)
   assert.equal(early.getBlockCalls, 1)
   assert.deepEqual(early.calls, [])
+  assert.deepEqual(early.multiCalls, [])
 
   const late = createApi(START_BLOCK + 5, { [START_BLOCK + 5]: responses }, { lazyBlock: true })
   await relaunchTvl(late)
   assert.equal(late.getBlockCalls, 1)
   assert.equal(late.calls.length, 14)
-  for (const call of late.calls) assert.equal(call.block, START_BLOCK + 5)
+  for (const call of [...late.calls, ...late.multiCalls]) assert.equal(call.block, START_BLOCK + 5)
 
-  const noBlock = { block: undefined, getBlock: async () => undefined, call: async () => assert.fail('no read expected'), add: () => assert.fail('no add expected') }
+  const noBlock = { block: undefined, getBlock: async () => undefined, call: async () => assert.fail('no read expected'), multiCall: async () => assert.fail('no read expected'), add: () => assert.fail('no add expected') }
   await assert.rejects(relaunchTvl(noBlock), /needs a block number/)
+})
+
+test('stops when OperationsAdmin does not have a manifest handler assigned to its pair', async t => {
+  const block = START_BLOCK + 10
+  const unrelated = fixtureAddress(0x0bad)
+  const cases = [
+    ['swapped idle and LayerBank handlers', { 'DOC:0': HANDLERS['DOC:1'], 'DOC:1': HANDLERS['DOC:0'] }, 'DOC:0', HANDLERS['DOC:1']],
+    ['swapped handlers of two tokens', { 'USDRIF:0': HANDLERS['USDT0:0'], 'USDT0:0': HANDLERS['USDRIF:0'] }, 'USDRIF:0', HANDLERS['USDT0:0']],
+    ['an unrelated address', { 'USDT0:1': unrelated }, 'USDT0:1', unrelated],
+    ['a zero return for a pair with no handler', { 'DOC:2': ZERO_ADDRESS }, 'DOC:2', ZERO_ADDRESS],
+    ['an empty answer', { 'USDRIF:1': '' }, 'USDRIF:1', '$'],
+  ]
+
+  for (const [name, assigned, pair, onChain] of cases) {
+    await t.test(name, async () => {
+      const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE, assigned) })
+
+      await assert.rejects(createRelaunchTvl(fixtureManifest())(api), error => {
+        assert.match(error.message, new RegExp(`manifest handler of pair ${pair} is ${HANDLERS[pair]}, but OperationsAdmin has ${onChain}`))
+        return true
+      })
+      // The check comes first: no custody read and no amount is reported.
+      assert.equal(api.multiCalls.length, 1)
+      assert.equal(api.multiCalls[0].block, block)
+      assert.deepEqual(api.calls, [])
+      assert.deepEqual(api.adds, [])
+    })
+  }
+
+  await t.test('a short OperationsAdmin answer', async () => {
+    const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE) })
+    api.multiCall = async () => [HANDLERS['DOC:0']]
+    await assert.rejects(createRelaunchTvl(fixtureManifest())(api), /did not answer for every pair/)
+    assert.deepEqual(api.adds, [])
+  })
+
+  await t.test('the adapter composition fails as a whole, with no partial relaunch amount', async () => {
+    const api = createLegacyApi(block, { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE, { 'DOC:0': HANDLERS['DOC:1'], 'DOC:1': HANDLERS['DOC:0'] }) } })
+    await assert.rejects(createTvl(fixtureManifest())(api), /manifest handler of pair DOC:0/)
+    assert.equal(api.balances[USDT0.toLowerCase()], undefined)
+  })
+})
+
+test('accepts an on-chain handler address that differs from the manifest only in letter case', async () => {
+  const block = START_BLOCK + 10
+  const upper = address => `0x${address.slice(2).toUpperCase()}`
+  const assigned = Object.fromEntries(SUPPORTED_PAIRS.map(pair => [pair, upper(HANDLERS[pair])]))
+  const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE, assigned) })
+
+  await createRelaunchTvl(fixtureManifest())(api)
+
+  assert.deepEqual(api.balances, sumByToken(SEVEN_PAIR_EXPECTED))
 })
 
 test('accepts the fixture manifest and returns the seven handlers with their routes', () => {
@@ -449,6 +552,10 @@ test('reads only the handlers of an explicit active subset', async () => {
   await createRelaunchTvl(manifest)(api)
 
   assert.equal(api.calls.length, 4)
+  assert.deepEqual(api.multiCalls.map(({ calls }) => calls), [[
+    { params: [DOC, 0] },
+    { params: [USDT0, 1] },
+  ]])
   assert.deepEqual(api.balances, {
     [DOC.toLowerCase()]: SEVEN_PAIR_EXPECTED['DOC:0'],
     [USDT0.toLowerCase()]: SEVEN_PAIR_EXPECTED['USDT0:1'],
@@ -516,7 +623,7 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
   assert.match(adapter.methodology, /rBTC that was bought and waits for user withdrawal is excluded/)
 })
 
-test('legacy and relaunch totals stay separate and add up on one API', async () => {
+test('legacy and relaunch totals stay separate and add up in the composition index.js uses', async () => {
   const block = START_BLOCK + 10
   const relaunchResponses = custodyResponses(SEVEN_PAIR_STATE)
   const relaunchTvl = createRelaunchTvl(fixtureManifest())
@@ -534,9 +641,10 @@ test('legacy and relaunch totals stay separate and add up on one API', async () 
   for (const call of relaunchApi.calls) assert.equal(legacyKeys.has(call.key), false)
 
   const bothApi = createLegacyApi(block, { [block]: { ...LEGACY_RESPONSES, ...relaunchResponses } })
-  await legacyTvl(bothApi)
-  await relaunchTvl(bothApi)
+  await createTvl(fixtureManifest())(bothApi)
   assert.equal(bothApi.calls.length, 20)
+  assert.equal(bothApi.multiCalls.length, 1)
+  for (const call of [...bothApi.calls, ...bothApi.multiCalls]) assert.equal(call.block, block)
   assert.deepEqual(bothApi.balances, {
     [DOC.toLowerCase()]: LEGACY_EXPECTED[DOC.toLowerCase()] + sumByToken(SEVEN_PAIR_EXPECTED)[DOC.toLowerCase()],
     [USDRIF.toLowerCase()]: LEGACY_EXPECTED[USDRIF.toLowerCase()] + sumByToken(SEVEN_PAIR_EXPECTED)[USDRIF.toLowerCase()],
@@ -545,8 +653,8 @@ test('legacy and relaunch totals stay separate and add up on one API', async () 
 
   // Before the start block the same composition gives the legacy result only.
   const earlyApi = createLegacyApi(9294353, { 9294353: { ...LEGACY_RESPONSES, ...relaunchResponses } })
-  await legacyTvl(earlyApi)
-  await relaunchTvl(earlyApi)
+  await createTvl(fixtureManifest())(earlyApi)
   assert.deepEqual(earlyApi.balances, LEGACY_EXPECTED)
   assert.equal(earlyApi.calls.length, 6)
+  assert.deepEqual(earlyApi.multiCalls, [])
 })
