@@ -1,4 +1,4 @@
-const { LEGACY_ADDRESSES } = require('./legacy')
+const { legacyTvl, LEGACY_ADDRESSES } = require('./legacy')
 
 // The relaunch contracts are not deployed. This stays null until a later
 // address-only change supplies the verified deployment manifest.
@@ -9,7 +9,7 @@ const { LEGACY_ADDRESSES } = require('./legacy')
 //   verified: true,                 // a human approved this manifest after deployment
 //   protocolVersion: '<version>',
 //   chainId: 30,
-//   startBlock: <deployment block>,
+//   startBlock: <first block at which OperationsAdmin has every listed handler assigned>,
 //   dcaManager: '0x...',
 //   operationsAdmin: '0x...',
 //   tokens: { DOC: '0x...', USDRIF: '0x...', USDT0: '0x...' },
@@ -64,6 +64,7 @@ const ABI = {
   pool: 'address:POOL',
   getReserveNormalizedIncome: 'function getReserveNormalizedIncome(address) view returns (uint256)',
   tokenPrice: 'uint256:tokenPrice',
+  getHandler: 'function getHandler(address token, uint256 routeIndex) view returns (address)',
 }
 
 const MANIFEST_KEYS = ['verified', 'protocolVersion', 'chainId', 'startBlock', 'dcaManager', 'operationsAdmin', 'tokens', 'handlers', 'activePairs']
@@ -192,6 +193,25 @@ async function resolveBlock(api) {
   return block
 }
 
+// Checks on chain, at the block of the supplied API, that OperationsAdmin has each manifest
+// handler assigned to its token and route. A swapped or unrelated handler would report zero
+// without an error, so any difference stops the adapter.
+async function requireAssignedHandlers(api, { operationsAdmin, handlers }) {
+  const assigned = await api.multiCall({
+    target: operationsAdmin,
+    abi: ABI.getHandler,
+    calls: handlers.map(({ stablecoin, routeIndex }) => ({ params: [stablecoin, routeIndex] })),
+  })
+  if (!Array.isArray(assigned) || assigned.length !== handlers.length)
+    throw new Error('BitChill relaunch TVL: OperationsAdmin did not answer for every pair')
+
+  handlers.forEach(({ pair, handler }, position) => {
+    const onChain = assigned[position]
+    if (typeof onChain !== 'string' || onChain.toLowerCase() !== handler.toLowerCase())
+      throw new Error(`BitChill relaunch TVL: the manifest handler of pair ${pair} is ${handler}, but OperationsAdmin has ${String(onChain)}`)
+  })
+}
+
 // Underlying stablecoin of one handler. Each handler type has one source of value, so a
 // receipt token and its underlying are never added together.
 async function handlerUnderlying(api, { protocol, handler, stablecoin, layerBankAToken, sovrynIToken }) {
@@ -228,8 +248,20 @@ function createRelaunchTvl(manifest) {
   return async function relaunchTvl(api) {
     if (await resolveBlock(api) < deployment.startBlock) return
 
+    await requireAssignedHandlers(api, deployment)
     const amounts = await Promise.all(deployment.handlers.map(entry => handlerUnderlying(api, entry)))
     deployment.handlers.forEach(({ stablecoin }, position) => api.add(stablecoin, amounts[position]))
+  }
+}
+
+// Builds the adapter TVL function: the legacy reader, then the relaunch reader.
+// The two deployments keep separate readers and separate totals.
+function createTvl(manifest) {
+  const relaunchTvl = createRelaunchTvl(manifest)
+
+  return async function tvl(api) {
+    await legacyTvl(api)
+    await relaunchTvl(api)
   }
 }
 
@@ -239,4 +271,5 @@ module.exports = {
   TOKENS,
   validateRelaunchManifest,
   createRelaunchTvl,
+  createTvl,
 }
