@@ -563,8 +563,14 @@ test('reads only the handlers of an explicit active subset', async () => {
 })
 
 test('a stablecoin spent in a purchase is not counted again as rBTC', async () => {
-  // DOC idle and USDT0 LayerBank handlers through purchase, claim and withdrawal.
-  // The rbtc fields describe the handler state. The adapter must never read them.
+  // DOC idle is a MoC-style handler: bought rBTC waits on it as native rBTC.
+  // USDT0 LayerBank is a Uniswap-style handler: bought rBTC waits on it as WRBTC.
+  // The fake API serves these rBTC and WRBTC balances and the user claims, so the
+  // exclusion is proven against data that exists.
+  const ABI_CLAIM = 'function getAccumulatedRbtcBalance(address) view returns (uint256)'
+  const USER = fixtureAddress(0x0777)
+  const mocHandler = HANDLERS['DOC:0']
+  const dexHandler = HANDLERS['USDT0:1']
   const index = '1100000000000000000000000000'
   const idleOthers = { 'DOC:1': { scaled: '0', index }, 'DOC:2': { shares: '0', price: '1000000000000000000' }, 'USDRIF:0': '0', 'USDRIF:1': { scaled: '0', index }, 'USDT0:0': '0' }
   const states = [
@@ -572,7 +578,7 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
       name: 'before purchase',
       block: START_BLOCK + 100,
       custody: { 'DOC:0': '1000000000000000000000', 'USDT0:1': { scaled: '2000000000', index } },
-      rbtc: { handlerNativeBalance: 0n, userClaims: 0n },
+      rbtc: { native: '0', wrbtc: '0' },
       expected: { doc: 1000000000000000000000n, usdt0: 2200000000n },
     },
     {
@@ -580,14 +586,14 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
       block: START_BLOCK + 200,
       // 250 DOC and 550 USDT0 (500000000 scaled shares) were sold for rBTC.
       custody: { 'DOC:0': '750000000000000000000', 'USDT0:1': { scaled: '1500000000', index } },
-      rbtc: { handlerNativeBalance: 12500000000000000n, userClaims: 12500000000000000n },
+      rbtc: { native: '5000000000000000', wrbtc: '11000000000000000' },
       expected: { doc: 750000000000000000000n, usdt0: 1650000000n },
     },
     {
       name: 'after the users withdraw their rBTC',
       block: START_BLOCK + 300,
       custody: { 'DOC:0': '750000000000000000000', 'USDT0:1': { scaled: '1500000000', index } },
-      rbtc: { handlerNativeBalance: 0n, userClaims: 0n },
+      rbtc: { native: '0', wrbtc: '0' },
       expected: { doc: 750000000000000000000n, usdt0: 1650000000n },
     },
   ]
@@ -595,7 +601,36 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
   const relaunchTvl = createRelaunchTvl(fixtureManifest())
   const results = []
   for (const state of states) {
-    const api = createApi(state.block, { [state.block]: custodyResponses({ ...idleOthers, ...state.custody }) })
+    const rbtcResponses = {
+      [callKey({ target: WRBTC, abi: ABI_BALANCE_OF, params: [dexHandler] })]: state.rbtc.wrbtc,
+      [callKey({ target: mocHandler, abi: ABI_CLAIM, params: [USER] })]: state.rbtc.native,
+      [callKey({ target: dexHandler, abi: ABI_CLAIM, params: [USER] })]: state.rbtc.wrbtc,
+    }
+    const api = createApi(state.block, { [state.block]: { ...custodyResponses({ ...idleOthers, ...state.custody }), ...rbtcResponses } })
+    // Native balances and a generic token sweep exist on this fake API and would report the rBTC.
+    const nativeBalances = { [mocHandler.toLowerCase()]: state.rbtc.native }
+    let otherReads = 0
+    api.sumTokens = async ({ owners = [], tokens = [] }) => {
+      otherReads += 1
+      for (const owner of owners) {
+        api.add(ZERO_ADDRESS, BigInt(nativeBalances[owner.toLowerCase()] ?? 0))
+        for (const token of tokens)
+          api.add(token, BigInt(rbtcResponses[callKey({ target: token, abi: ABI_BALANCE_OF, params: [owner] })] ?? 0))
+      }
+    }
+    api.getGasTokenBalance = async owner => {
+      otherReads += 1
+      return nativeBalances[owner.toLowerCase()] ?? '0'
+    }
+
+    // The served rBTC data is real: a sweep of the two handlers would report it.
+    await api.sumTokens({ owners: [mocHandler, dexHandler], tokens: [WRBTC] })
+    assert.equal(api.balances[ZERO_ADDRESS], BigInt(state.rbtc.native), state.name)
+    assert.equal(api.balances[WRBTC.toLowerCase()], BigInt(state.rbtc.wrbtc), state.name)
+    api.balances = {}
+    api.adds.length = 0
+    otherReads = 0
+
     await relaunchTvl(api)
 
     // Only stablecoin keys exist: no native rBTC, no WRBTC, no other asset.
@@ -607,9 +642,13 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
     assert.equal(api.balances[ZERO_ADDRESS], undefined)
     assert.equal(api.balances[WRBTC.toLowerCase()], undefined)
 
-    // No read asks a handler for its rBTC: every call is a token or lender view with a known ABI.
+    // The reader asked for none of the served rBTC data.
+    assert.equal(otherReads, 0)
+    const requested = new Set(api.calls.map(call => call.key))
+    for (const key of Object.keys(rbtcResponses)) assert.equal(requested.has(key), false)
     for (const call of api.calls) {
       assert.ok([ABI_BALANCE_OF, ABI_SCALED_BALANCE_OF, ABI_POOL, ABI_NORMALIZED_INCOME, ABI_TOKEN_PRICE].includes(call.abi))
+      assert.notEqual(call.target.toLowerCase(), WRBTC.toLowerCase())
       assert.equal(Object.values(HANDLERS).map(address => address.toLowerCase()).includes(call.target.toLowerCase()), false)
     }
     results.push(api.balances)
@@ -621,6 +660,7 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
   // The rBTC withdrawal does not change TVL.
   assert.deepEqual(results[2], results[1])
   assert.match(adapter.methodology, /rBTC that was bought and waits for user withdrawal is excluded/)
+  assert.match(adapter.methodology, /Sovryn positions are reported before any Sovryn exit fee/)
 })
 
 test('legacy and relaunch totals stay separate and add up in the composition index.js uses', async () => {
