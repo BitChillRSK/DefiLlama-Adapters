@@ -2,7 +2,8 @@ const { legacyTvl, LEGACY_ADDRESSES } = require('./legacy')
 
 // The relaunch contracts are not deployed. This stays null until a later
 // address-only change supplies the verified deployment manifest.
-// While it is null the relaunch reader makes no call and adds nothing.
+// While it is null the relaunch readers make no call and add nothing.
+// The `bitchill` and `bitchill-idle` adapters both read this one manifest.
 //
 // Manifest shape (every address is a BitChill relaunch address or a token):
 // {
@@ -22,11 +23,17 @@ const RSK_CHAIN_ID = 30
 
 // Route indexes of the relaunch map. Index 1 is LayerBank here (it was Tropykus in legacy).
 // Indexes 3 and 4 are not available.
+//
+// Each route has one accounting category. DefiLlama applies `doublecounted` to a whole
+// adapter, so each category has its own adapter: idle cash is in `bitchill-idle` (not
+// double counted) and lender positions are in `bitchill` (double counted). A handler has
+// one route, so it is in one adapter only.
 const ROUTES = {
-  0: 'idle',
-  1: 'layerbank',
-  2: 'sovryn',
+  0: { protocol: 'idle', category: 'idle' },
+  1: { protocol: 'layerbank', category: 'lending' },
+  2: { protocol: 'sovryn', category: 'lending' },
 }
+const CATEGORIES = ['idle', 'lending']
 
 // Stablecoins and third-party lender tokens on Rootstock mainnet.
 // These are not BitChill deployment addresses.
@@ -148,7 +155,8 @@ function validateRelaunchManifest(manifest) {
       pair,
       symbol: entry.token,
       routeIndex: entry.routeIndex,
-      protocol: ROUTES[entry.routeIndex],
+      protocol: ROUTES[entry.routeIndex].protocol,
+      category: ROUTES[entry.routeIndex].category,
       handler,
       stablecoin: token.address,
       decimals: token.decimals,
@@ -238,31 +246,45 @@ async function handlerUnderlying(api, { protocol, handler, stablecoin, layerBank
   throw new Error(`Unknown relaunch route: ${protocol}`)
 }
 
-// Builds the relaunch reader. A null manifest gives a reader that does nothing.
+// Builds the relaunch reader of one category ('idle' or 'lending'). It reads and adds only the
+// handlers of that category. A null manifest, or a manifest with no handler of that category,
+// gives a reader that does nothing.
 // A manifest with a defect throws here, so a bad manifest cannot report a partial TVL.
-function createRelaunchTvl(manifest) {
+function createRelaunchTvl(manifest, category) {
+  if (!CATEGORIES.includes(category)) throw new Error(`Unknown BitChill relaunch category: ${String(category)}`)
   if (manifest === null || manifest === undefined) return async () => {}
 
   const deployment = validateRelaunchManifest(manifest)
+  const handlers = deployment.handlers.filter(entry => entry.category === category)
+  if (handlers.length === 0) return async () => {}
 
   return async function relaunchTvl(api) {
     if (await resolveBlock(api) < deployment.startBlock) return
 
+    // Every manifest handler is checked, not only this category. An adapter with no handler of its
+    // category returns before this check, so a wrong on-chain assignment stops only the adapters that read.
     await requireAssignedHandlers(api, deployment)
-    const amounts = await Promise.all(deployment.handlers.map(entry => handlerUnderlying(api, entry)))
-    deployment.handlers.forEach(({ stablecoin }, position) => api.add(stablecoin, amounts[position]))
+    const amounts = await Promise.all(handlers.map(entry => handlerUnderlying(api, entry)))
+    handlers.forEach(({ stablecoin }, position) => api.add(stablecoin, amounts[position]))
   }
 }
 
-// Builds the adapter TVL function: the legacy reader, then the relaunch reader.
-// The two deployments keep separate readers and separate totals.
-function createTvl(manifest) {
-  const relaunchTvl = createRelaunchTvl(manifest)
+// TVL function of the `bitchill` adapter (double counted): the legacy reader, then the
+// relaunch lending reader. Every legacy handler is a lending handler. The two deployments
+// keep separate readers and separate totals.
+function createLendingTvl(manifest) {
+  const relaunchLendingTvl = createRelaunchTvl(manifest, 'lending')
 
   return async function tvl(api) {
     await legacyTvl(api)
-    await relaunchTvl(api)
+    await relaunchLendingTvl(api)
   }
+}
+
+// TVL function of the `bitchill-idle` adapter (not double counted): the relaunch idle reader.
+// The legacy deployment has no idle handler.
+function createIdleTvl(manifest) {
+  return createRelaunchTvl(manifest, 'idle')
 }
 
 module.exports = {
@@ -271,5 +293,6 @@ module.exports = {
   TOKENS,
   validateRelaunchManifest,
   createRelaunchTvl,
-  createTvl,
+  createLendingTvl,
+  createIdleTvl,
 }
