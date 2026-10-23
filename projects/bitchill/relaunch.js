@@ -261,7 +261,8 @@ function createRelaunchTvl(manifest, category) {
   return async function relaunchTvl(api) {
     if (await resolveBlock(api) < deployment.startBlock) return
 
-    // Every manifest handler is checked, not only this category: a wrong manifest stops both adapters.
+    // Every manifest handler is checked, not only this category. An adapter with no handler of its
+    // category returns before this check, so a wrong on-chain assignment stops only the adapters that read.
     await requireAssignedHandlers(api, deployment)
     const amounts = await Promise.all(handlers.map(entry => handlerUnderlying(api, entry)))
     handlers.forEach(({ stablecoin }, position) => api.add(stablecoin, amounts[position]))
