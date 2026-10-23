@@ -225,6 +225,20 @@ const relaunchReaders = manifest => ({
   lending: createRelaunchTvl(manifest, 'lending'),
 })
 
+// A fixture manifest with an explicit active subset and only the handlers of that subset.
+const subsetManifest = pairs => fixtureManifest({
+  activePairs: pairs,
+  handlers: fixtureManifest().handlers.filter(({ token, routeIndex }) => pairs.includes(`${token}:${routeIndex}`)),
+})
+
+// An API that fails on any use. A reader with nothing to read must not touch it.
+const untouchableApi = () => new Proxy({}, {
+  get(_, property) {
+    if (property === 'then') return undefined
+    throw new Error(`relaunch reader used api.${String(property)} with nothing to read`)
+  },
+})
+
 test('ships no relaunch manifest and the adapter result equals the legacy reader alone', async () => {
   assert.equal(RELAUNCH_MANIFEST, null)
   assert.equal(adapter.doublecounted, true)
@@ -246,12 +260,7 @@ test('ships no relaunch manifest and the adapter result equals the legacy reader
 })
 
 test('a missing manifest gives a reader that never uses the API', async () => {
-  const untouchable = new Proxy({}, {
-    get(_, property) {
-      if (property === 'then') return undefined
-      throw new Error(`relaunch reader used api.${String(property)} without a manifest`)
-    },
-  })
+  const untouchable = untouchableApi()
 
   for (const category of ['idle', 'lending']) {
     await createRelaunchTvl(null, category)(untouchable)
@@ -605,11 +614,7 @@ test('rejects defective manifests', async t => {
 })
 
 test('reads only the handlers of an explicit active subset', async () => {
-  const activePairs = ['DOC:0', 'USDT0:1']
-  const manifest = fixtureManifest({
-    activePairs,
-    handlers: fixtureManifest().handlers.filter(({ token, routeIndex }) => activePairs.includes(`${token}:${routeIndex}`)),
-  })
+  const manifest = subsetManifest(['DOC:0', 'USDT0:1'])
   const block = START_BLOCK + 1
   const responses = custodyResponses({ 'DOC:0': SEVEN_PAIR_STATE['DOC:0'], 'USDT0:1': SEVEN_PAIR_STATE['USDT0:1'] })
   const readers = relaunchReaders(manifest)
@@ -783,4 +788,173 @@ test('legacy and relaunch totals stay separate and add up in the compositions th
   assert.deepEqual(earlyIdleApi.balances, {})
   assert.deepEqual(earlyIdleApi.calls, [])
   assert.deepEqual(earlyIdleApi.multiCalls, [])
+})
+
+test('the idle adapter is a separate listing without the double-counted classification', () => {
+  assert.equal(adapter.doublecounted, true)
+  assert.equal(Object.hasOwn(idleAdapter, 'doublecounted'), false)
+  assert.deepEqual(Object.keys(idleAdapter).sort(), ['methodology', 'rsk'])
+  assert.deepEqual(Object.keys(idleAdapter.rsk), ['tvl'])
+  assert.deepEqual(Object.keys(adapter.rsk), ['tvl'])
+  assert.notEqual(idleAdapter.rsk.tvl, adapter.rsk.tvl)
+
+  // Each methodology names the other adapter. The legacy sentences are unchanged.
+  assert.match(adapter.methodology, /Relaunch idle handlers are not counted here: the separate bitchill-idle adapter reports them\./)
+  assert.match(adapter.methodology, /Legacy handlers: Tropykus values kToken balances with exchangeRateStored\. Sovryn values handler assets and attributes them to loanTokenAddress\./)
+  assert.doesNotMatch(adapter.methodology, /idle handlers count/)
+  assert.match(idleAdapter.methodology, /lending handlers are not counted here: the separate bitchill adapter reports them as double counted\./)
+  assert.match(idleAdapter.methodology, /counted only from the start block of a verified deployment manifest/)
+})
+
+test('a relaunch reader needs an explicit category', () => {
+  for (const manifest of [null, fixtureManifest()])
+    for (const category of [undefined, 'all', 'Idle', 'layerbank', 0])
+      assert.throws(() => createRelaunchTvl(manifest, category), /Unknown BitChill relaunch category/)
+})
+
+test('mixed totals: each handler is read by one adapter only, and the two adapters count each handler once', async () => {
+  const block = START_BLOCK + 10
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE) } }
+  const manifest = fixtureManifest()
+
+  const lendingApi = createLegacyApi(block, responses)
+  await createLendingTvl(manifest)(lendingApi)
+  const idleApi = createLegacyApi(block, responses)
+  await createIdleTvl(manifest)(idleApi)
+
+  // The custody read of a handler takes the handler as its argument. Map each such read to its pair.
+  const pairsRead = api => api.calls
+    .map(call => Object.keys(HANDLERS).find(pair => HANDLERS[pair].toLowerCase() === String(call.params?.[0]).toLowerCase()))
+    .filter(Boolean)
+  const idlePairs = pairsRead(idleApi)
+  const lendingPairs = pairsRead(lendingApi)
+  assert.deepEqual(idlePairs, IDLE_PAIRS)
+  assert.deepEqual([...lendingPairs].sort(), [...LENDING_PAIRS].sort())
+  assert.deepEqual([...idlePairs, ...lendingPairs].sort(), [...SUPPORTED_PAIRS].sort())
+
+  // No read is made by both adapters, and the idle adapter makes no legacy read.
+  const lendingKeys = new Set(lendingApi.calls.map(call => call.key))
+  for (const call of idleApi.calls) assert.equal(lendingKeys.has(call.key), false)
+
+  // One add per handler: three legacy and four relaunch lending adds, three relaunch idle adds.
+  assert.equal(lendingApi.adds.length, 3 + LENDING_PAIRS.length)
+  assert.equal(idleApi.adds.length, IDLE_PAIRS.length)
+
+  // The sum of the two adapters is the legacy total plus one count of each relaunch handler.
+  const combined = {}
+  for (const balances of [lendingApi.balances, idleApi.balances])
+    for (const [token, amount] of Object.entries(balances)) combined[token] = (combined[token] ?? 0n) + amount
+  const relaunchOnce = sumByToken(SEVEN_PAIR_EXPECTED)
+  assert.deepEqual(combined, {
+    [DOC.toLowerCase()]: LEGACY_EXPECTED[DOC.toLowerCase()] + relaunchOnce[DOC.toLowerCase()],
+    [USDRIF.toLowerCase()]: LEGACY_EXPECTED[USDRIF.toLowerCase()] + relaunchOnce[USDRIF.toLowerCase()],
+    [USDT0.toLowerCase()]: relaunchOnce[USDT0.toLowerCase()],
+  })
+
+  // Hand-checked split: idle cash only in the idle adapter, lender positions only in the lending adapter.
+  assert.deepEqual(idleApi.balances, {
+    [DOC.toLowerCase()]: 1000000000000000000001n,
+    [USDRIF.toLowerCase()]: 400000000000000000000n,
+    [USDT0.toLowerCase()]: 2500000001n,
+  })
+  assert.deepEqual(lendingApi.balances, {
+    [DOC.toLowerCase()]: 15309347739976302686n + 1454252674737243840448n + 2100000000000000000000n + 3703703670370370367000n,
+    [USDRIF.toLowerCase()]: 16708418721585n + 10n,
+    [USDT0.toLowerCase()]: 1000000000n,
+  })
+})
+
+test('an idle-only manifest gives the lending adapter the legacy result alone', async () => {
+  const manifest = subsetManifest(IDLE_PAIRS)
+  const block = START_BLOCK + 10
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SEVEN_PAIR_STATE, IDLE_PAIRS)) } }
+
+  // No relaunch lending handler: the relaunch lending reader never uses the API.
+  await createRelaunchTvl(manifest, 'lending')(untouchableApi())
+  const lendingApi = createLegacyApi(block, responses)
+  await createLendingTvl(manifest)(lendingApi)
+  assert.deepEqual(lendingApi.balances, LEGACY_EXPECTED)
+  assert.equal(lendingApi.calls.length, 6)
+  assert.deepEqual(lendingApi.multiCalls, [])
+  assert.equal(lendingApi.getBlockCalls, 0)
+
+  const idleApi = createApi(block, responses)
+  await createIdleTvl(manifest)(idleApi)
+  assert.equal(idleApi.calls.length, IDLE_PAIRS.length)
+  assert.deepEqual(idleApi.multiCalls.map(({ calls }) => calls), [assignmentCalls(IDLE_PAIRS)])
+  assert.deepEqual(idleApi.balances, sumByToken(pick(SEVEN_PAIR_EXPECTED, IDLE_PAIRS)))
+})
+
+test('a lending-only manifest gives an idle adapter that never uses the API', async () => {
+  const manifest = subsetManifest(LENDING_PAIRS)
+  const block = START_BLOCK + 10
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SEVEN_PAIR_STATE, LENDING_PAIRS)) } }
+
+  await createIdleTvl(manifest)(untouchableApi())
+  await createRelaunchTvl(manifest, 'idle')(untouchableApi())
+
+  const lendingApi = createLegacyApi(block, responses)
+  await createLendingTvl(manifest)(lendingApi)
+  assert.equal(lendingApi.calls.length, 6 + CATEGORY_CALLS.lending)
+  assert.deepEqual(lendingApi.multiCalls.map(({ calls }) => calls), [assignmentCalls(LENDING_PAIRS)])
+  const lendingExpected = sumByToken(pick(SEVEN_PAIR_EXPECTED, LENDING_PAIRS))
+  assert.deepEqual(lendingApi.balances, {
+    [DOC.toLowerCase()]: LEGACY_EXPECTED[DOC.toLowerCase()] + lendingExpected[DOC.toLowerCase()],
+    [USDRIF.toLowerCase()]: LEGACY_EXPECTED[USDRIF.toLowerCase()] + lendingExpected[USDRIF.toLowerCase()],
+    [USDT0.toLowerCase()]: lendingExpected[USDT0.toLowerCase()],
+  })
+})
+
+test('the DOC-only and six-pair launch subsets are split between the adapters with no Sovryn read', async t => {
+  const subsets = [
+    ['DOC-only', ['DOC:0', 'DOC:1'], { idle: { DOC: 1000000000000000000001n }, lending: { DOC: 2100000000000000000000n } }],
+    ['six-pair', ['DOC:0', 'DOC:1', 'USDRIF:0', 'USDRIF:1', 'USDT0:0', 'USDT0:1'], {
+      idle: { DOC: 1000000000000000000001n, USDRIF: 400000000000000000000n, USDT0: 2500000001n },
+      lending: { DOC: 2100000000000000000000n, USDRIF: 10n, USDT0: 1000000000n },
+    }],
+  ]
+
+  for (const [name, pairs, expected] of subsets) {
+    await t.test(name, async () => {
+      const manifest = subsetManifest(pairs)
+      const block = START_BLOCK + 10
+      const responses = { [block]: custodyResponses(pick(SEVEN_PAIR_STATE, pairs)) }
+
+      const apis = { idle: createApi(block, responses), lending: createApi(block, responses) }
+      await createIdleTvl(manifest)(apis.idle)
+      await createRelaunchTvl(manifest, 'lending')(apis.lending)
+
+      const byKey = amounts => Object.fromEntries(Object.entries(amounts).map(([symbol, amount]) => [TOKENS[symbol].address.toLowerCase(), amount]))
+      for (const category of ['idle', 'lending']) {
+        const api = apis[category]
+        const categoryPairs = pairs.filter(pair => CATEGORY_PAIRS[category].includes(pair))
+        // Idle: one read per handler. LayerBank: three reads per handler.
+        assert.equal(api.calls.length, (category === 'idle' ? 1 : 3) * categoryPairs.length)
+        assert.deepEqual(api.multiCalls.map(({ calls }) => calls), [assignmentCalls(pairs)])
+        assert.equal(api.calls.some(call => call.target.toLowerCase() === TOKENS.DOC.sovrynIToken.toLowerCase()), false)
+        assert.deepEqual(api.balances, byKey(expected[category]))
+      }
+    })
+  }
+})
+
+test('historical blocks: before the start block the lending adapter is legacy only and the idle adapter reports nothing', async () => {
+  const manifest = fixtureManifest()
+  // Fixture values at each block. Only the block numbers are historical.
+  for (const block of [9200000, 9294353, START_BLOCK - 1]) {
+    const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE) } }
+
+    const lendingApi = createLegacyApi(block, responses)
+    await createLendingTvl(manifest)(lendingApi)
+    assert.deepEqual(lendingApi.balances, LEGACY_EXPECTED)
+    assert.equal(lendingApi.calls.length, 6)
+    for (const call of lendingApi.calls) assert.equal(call.block, block)
+    assert.deepEqual(lendingApi.multiCalls, [])
+
+    const idleApi = createLegacyApi(block, responses)
+    await createIdleTvl(manifest)(idleApi)
+    assert.deepEqual(idleApi.calls, [])
+    assert.deepEqual(idleApi.multiCalls, [])
+    assert.deepEqual(idleApi.balances, {})
+  }
 })
