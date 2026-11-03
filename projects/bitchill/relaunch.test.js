@@ -27,7 +27,6 @@ const POOLS = {
 const HANDLERS = {
   'DOC:0': fixtureAddress(0x0100),
   'DOC:1': fixtureAddress(0x0101),
-  'DOC:2': fixtureAddress(0x0102),
   'USDRIF:0': fixtureAddress(0x0200),
   'USDRIF:1': fixtureAddress(0x0201),
   'USDT0:0': fixtureAddress(0x0300),
@@ -45,11 +44,9 @@ const ABI_BALANCE_OF = 'erc20:balanceOf'
 const ABI_SCALED_BALANCE_OF = 'function scaledBalanceOf(address) view returns (uint256)'
 const ABI_POOL = 'address:POOL'
 const ABI_NORMALIZED_INCOME = 'function getReserveNormalizedIncome(address) view returns (uint256)'
-const ABI_TOKEN_PRICE = 'uint256:tokenPrice'
 const ABI_GET_HANDLER = 'function getHandler(address token, uint256 routeIndex) view returns (address)'
 
 const RAY = 10n ** 27n
-const WAD = 10n ** 18n
 
 function fixtureManifest(overrides = {}) {
   return {
@@ -133,7 +130,7 @@ const getHandlerKey = pair => {
 }
 
 // Builds the lender, token and OperationsAdmin responses for a custody state.
-// state: { 'DOC:0': cash, 'DOC:1': { scaled, index }, 'DOC:2': { shares, price }, ... }
+// state: { 'DOC:0': cash, 'DOC:1': { scaled, index }, ... }
 // assigned: what OperationsAdmin.getHandler returns for a pair, when it differs from the manifest.
 function custodyResponses(state, assigned = {}) {
   const responses = {}
@@ -144,33 +141,29 @@ function custodyResponses(state, assigned = {}) {
     responses[getHandlerKey(pair)] = assigned[pair] ?? handler
     if (routeIndex === '0') {
       responses[callKey({ target: token.address, abi: ABI_BALANCE_OF, params: [handler] })] = value
-    } else if (routeIndex === '1') {
+    } else {
+      assert.equal(routeIndex, '1', `unsupported fixture pair ${pair}`)
       responses[callKey({ target: token.layerBankAToken, abi: ABI_SCALED_BALANCE_OF, params: [handler] })] = value.scaled
       responses[callKey({ target: token.layerBankAToken, abi: ABI_POOL })] = POOLS[symbol]
       responses[callKey({ target: POOLS[symbol], abi: ABI_NORMALIZED_INCOME, params: [token.address] })] = value.index
-    } else {
-      responses[callKey({ target: token.sovrynIToken, abi: ABI_BALANCE_OF, params: [handler] })] = value.shares
-      responses[callKey({ target: token.sovrynIToken, abi: ABI_TOKEN_PRICE })] = value.price
     }
   }
   return responses
 }
 
 // Amounts are decimal strings, as the SDK returns them.
-const SEVEN_PAIR_STATE = {
+const SIX_PAIR_STATE = {
   'DOC:0': '1000000000000000000001', // 1000 DOC and 1 wei
   'DOC:1': { scaled: '2000000000000000000000', index: '1050000000000000000000000001' },
-  'DOC:2': { shares: '3000000000000000000000', price: '1234567890123456789' },
   'USDRIF:0': '400000000000000000000',
   'USDRIF:1': { scaled: '7', index: '1500000000000000000000000001' },
   'USDT0:0': '2500000001', // 2500.000001 USDT0 (6 decimals)
   'USDT0:1': { scaled: '999999999', index: '1000000002000000000000000000' },
 }
 
-const SEVEN_PAIR_EXPECTED = {
+const SIX_PAIR_EXPECTED = {
   'DOC:0': 1000000000000000000001n,
   'DOC:1': 2000000000000000000000n * 1050000000000000000000000001n / RAY,
-  'DOC:2': 3000000000000000000000n * 1234567890123456789n / WAD,
   'USDRIF:0': 400000000000000000000n,
   'USDRIF:1': 7n * 1500000000000000000000000001n / RAY,
   'USDT0:0': 2500000001n,
@@ -211,12 +204,12 @@ function sumByToken(expectedByPair) {
   return totals
 }
 
-// Route 0 is idle cash (the `bitchill-idle` adapter). Routes 1 and 2 are lender positions (the `bitchill` adapter).
+// Route 0 is idle cash (the `bitchill-idle` adapter). Route 1 is a LayerBank position (the `bitchill` adapter).
 const IDLE_PAIRS = SUPPORTED_PAIRS.filter(pair => pair.endsWith(':0'))
 const LENDING_PAIRS = SUPPORTED_PAIRS.filter(pair => !pair.endsWith(':0'))
 const CATEGORY_PAIRS = { idle: IDLE_PAIRS, lending: LENDING_PAIRS }
-// Custody reads per handler: idle 1, LayerBank 3, Sovryn 2.
-const CATEGORY_CALLS = { idle: 3, lending: 3 + 3 + 3 + 2 }
+// Custody reads per handler: idle 1, LayerBank 3.
+const CATEGORY_CALLS = { idle: 3, lending: 3 + 3 + 3 }
 
 const pick = (byPair, pairs) => Object.fromEntries(pairs.filter(pair => pair in byPair).map(pair => [pair, byPair[pair]]))
 const assignmentCalls = pairs => pairs.map(pair => ({ params: [TOKENS[pair.split(':')[0]].address, Number(pair.split(':')[1])] }))
@@ -279,33 +272,32 @@ test('a missing manifest gives a reader that never uses the API', async () => {
   assert.deepEqual(api.balances, LEGACY_EXPECTED)
 })
 
-test('lists exactly the seven supported pairs with their decimals', () => {
-  assert.deepEqual(SUPPORTED_PAIRS, ['DOC:0', 'DOC:1', 'DOC:2', 'USDRIF:0', 'USDRIF:1', 'USDT0:0', 'USDT0:1'])
+test('lists exactly the six supported pairs with their decimals', () => {
+  assert.deepEqual(SUPPORTED_PAIRS, ['DOC:0', 'DOC:1', 'USDRIF:0', 'USDRIF:1', 'USDT0:0', 'USDT0:1'])
   assert.deepEqual(Object.keys(HANDLERS), SUPPORTED_PAIRS)
   assert.equal(TOKENS.DOC.decimals, 18)
   assert.equal(TOKENS.USDRIF.decimals, 18)
   assert.equal(TOKENS.USDT0.decimals, 6)
 })
 
-test('counts one underlying amount per handler for all seven pairs with exact integer math', async () => {
+test('counts one underlying amount per handler for all six pairs with exact integer math', async () => {
   const block = START_BLOCK + 10
   const readers = relaunchReaders(fixtureManifest())
   const apis = {}
   for (const category of ['idle', 'lending']) {
-    apis[category] = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE) })
+    apis[category] = createApi(block, { [block]: custodyResponses(SIX_PAIR_STATE) })
     await readers[category](apis[category])
   }
 
   // One add per handler of the category, in manifest order, each with the handler's own stablecoin.
-  const addsOf = pairs => pairs.map(pair => ({ token: TOKENS[pair.split(':')[0]].address.toLowerCase(), amount: SEVEN_PAIR_EXPECTED[pair] }))
+  const addsOf = pairs => pairs.map(pair => ({ token: TOKENS[pair.split(':')[0]].address.toLowerCase(), amount: SIX_PAIR_EXPECTED[pair] }))
   assert.deepEqual(apis.idle.adds, addsOf(IDLE_PAIRS))
   assert.deepEqual(apis.lending.adds, addsOf(LENDING_PAIRS))
 
   // Hand-checked values: integer floors, 18 decimals and 6 decimals.
-  assert.equal(SEVEN_PAIR_EXPECTED['DOC:1'], 2100000000000000000000n)
-  assert.equal(SEVEN_PAIR_EXPECTED['DOC:2'], 3703703670370370367000n)
-  assert.equal(SEVEN_PAIR_EXPECTED['USDRIF:1'], 10n)
-  assert.equal(SEVEN_PAIR_EXPECTED['USDT0:1'], 1000000000n) // 1000000000.999999998 floors
+  assert.equal(SIX_PAIR_EXPECTED['DOC:1'], 2100000000000000000000n)
+  assert.equal(SIX_PAIR_EXPECTED['USDRIF:1'], 10n)
+  assert.equal(SIX_PAIR_EXPECTED['USDT0:1'], 1000000000n) // 1000000000.999999998 floors
 
   // Exact token keys: the three stablecoins and nothing else.
   assert.deepEqual(apis.idle.balances, {
@@ -314,21 +306,20 @@ test('counts one underlying amount per handler for all seven pairs with exact in
     [USDT0.toLowerCase()]: 2500000001n,
   })
   assert.deepEqual(apis.lending.balances, {
-    [DOC.toLowerCase()]: 2100000000000000000000n + 3703703670370370367000n,
+    [DOC.toLowerCase()]: 2100000000000000000000n,
     [USDRIF.toLowerCase()]: 10n,
     [USDT0.toLowerCase()]: 1000000000n,
   })
   for (const api of Object.values(apis)) {
     for (const token of Object.values(TOKENS)) {
       assert.equal(api.balances[token.layerBankAToken.toLowerCase()], undefined)
-      if (token.sovrynIToken) assert.equal(api.balances[token.sovrynIToken.toLowerCase()], undefined)
     }
   }
 })
 
 test('makes exactly the expected reads and every read uses the supplied block', async () => {
   const block = START_BLOCK + 10
-  const responses = custodyResponses(SEVEN_PAIR_STATE)
+  const responses = custodyResponses(SIX_PAIR_STATE)
   const custodyKeys = Object.keys(responses).filter(key => !key.includes(ABI_GET_HANDLER))
   const readers = relaunchReaders(fixtureManifest())
   const apis = {}
@@ -342,7 +333,7 @@ test('makes exactly the expected reads and every read uses the supplied block', 
     for (const call of api.calls) assert.equal(call.block, block)
     assert.equal(api.getBlockCalls, 0)
 
-    // One batched OperationsAdmin read checks all seven assignments, at the same block.
+    // One batched OperationsAdmin read checks all six assignments, at the same block.
     assert.deepEqual(api.multiCalls, [{
       block,
       target: OPERATIONS_ADMIN,
@@ -373,7 +364,7 @@ test('makes exactly the expected reads and every read uses the supplied block', 
 test('a read at a block without a fixture fails instead of using another block', async () => {
   const fixtureBlock = START_BLOCK + 10
   for (const relaunchTvl of Object.values(relaunchReaders(fixtureManifest()))) {
-    const api = createApi(START_BLOCK + 11, { [fixtureBlock]: custodyResponses(SEVEN_PAIR_STATE) })
+    const api = createApi(START_BLOCK + 11, { [fixtureBlock]: custodyResponses(SIX_PAIR_STATE) })
 
     await assert.rejects(relaunchTvl(api), /unexpected call at block 9500011/)
     assert.deepEqual(api.adds, [])
@@ -385,7 +376,6 @@ test('empty handlers add zero for each stablecoin', async () => {
   const responses = custodyResponses({
     'DOC:0': '0',
     'DOC:1': { scaled: '0', index: '1050000000000000000000000001' },
-    'DOC:2': { shares: '0', price: '1234567890123456789' },
     'USDRIF:0': '0',
     'USDRIF:1': { scaled: '0', index: '1500000000000000000000000001' },
     'USDT0:0': '0',
@@ -408,7 +398,7 @@ test('empty handlers add zero for each stablecoin', async () => {
 
 test('skips every relaunch read before the deployment start block and reads from it', async () => {
   const readers = relaunchReaders(fixtureManifest())
-  const responses = custodyResponses(SEVEN_PAIR_STATE)
+  const responses = custodyResponses(SIX_PAIR_STATE)
 
   for (const category of ['idle', 'lending']) {
     const relaunchTvl = readers[category]
@@ -426,13 +416,13 @@ test('skips every relaunch read before the deployment start block and reads from
     assert.equal(atStart.calls.length, CATEGORY_CALLS[category])
     assert.equal(atStart.multiCalls.length, 1)
     assert.equal(atStart.multiCalls[0].block, START_BLOCK)
-    assert.deepEqual(atStart.balances, sumByToken(pick(SEVEN_PAIR_EXPECTED, CATEGORY_PAIRS[category])))
+    assert.deepEqual(atStart.balances, sumByToken(pick(SIX_PAIR_EXPECTED, CATEGORY_PAIRS[category])))
   }
 })
 
 test('resolves an unset block through the supplied API only', async () => {
   const readers = relaunchReaders(fixtureManifest())
-  const responses = custodyResponses(SEVEN_PAIR_STATE)
+  const responses = custodyResponses(SIX_PAIR_STATE)
 
   for (const category of ['idle', 'lending']) {
     const relaunchTvl = readers[category]
@@ -461,15 +451,15 @@ test('stops when OperationsAdmin does not have a manifest handler assigned to it
     ['swapped idle and LayerBank handlers', { 'DOC:0': HANDLERS['DOC:1'], 'DOC:1': HANDLERS['DOC:0'] }, 'DOC:0', HANDLERS['DOC:1']],
     ['swapped handlers of two tokens', { 'USDRIF:0': HANDLERS['USDT0:0'], 'USDT0:0': HANDLERS['USDRIF:0'] }, 'USDRIF:0', HANDLERS['USDT0:0']],
     ['an unrelated address', { 'USDT0:1': unrelated }, 'USDT0:1', unrelated],
-    ['a zero return for a pair with no handler', { 'DOC:2': ZERO_ADDRESS }, 'DOC:2', ZERO_ADDRESS],
+    ['a zero return for a pair with no handler', { 'USDRIF:0': ZERO_ADDRESS }, 'USDRIF:0', ZERO_ADDRESS],
     ['an empty answer', { 'USDRIF:1': '' }, 'USDRIF:1', '$'],
   ]
 
   for (const [name, assigned, pair, onChain] of cases) {
-    // Each adapter checks all seven assignments, so a wrong manifest stops both, also for a pair of the other category.
+    // Each adapter checks all six assignments, so a wrong manifest stops both, also for a pair of the other category.
     for (const category of ['idle', 'lending']) {
       await t.test(`${name} (${category} reader)`, async () => {
-        const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE, assigned) })
+        const api = createApi(block, { [block]: custodyResponses(SIX_PAIR_STATE, assigned) })
 
         await assert.rejects(createRelaunchTvl(fixtureManifest(), category)(api), error => {
           assert.match(error.message, new RegExp(`manifest handler of pair ${pair} is ${HANDLERS[pair]}, but OperationsAdmin has ${onChain}`))
@@ -486,7 +476,7 @@ test('stops when OperationsAdmin does not have a manifest handler assigned to it
 
   await t.test('a short OperationsAdmin answer', async () => {
     for (const relaunchTvl of Object.values(relaunchReaders(fixtureManifest()))) {
-      const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE) })
+      const api = createApi(block, { [block]: custodyResponses(SIX_PAIR_STATE) })
       api.multiCall = async () => [HANDLERS['DOC:0']]
       await assert.rejects(relaunchTvl(api), /did not answer for every pair/)
       assert.deepEqual(api.adds, [])
@@ -494,7 +484,7 @@ test('stops when OperationsAdmin does not have a manifest handler assigned to it
   })
 
   await t.test('each adapter fails as a whole, with no partial relaunch amount', async () => {
-    const responses = { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE, { 'DOC:0': HANDLERS['DOC:1'], 'DOC:1': HANDLERS['DOC:0'] }) }
+    const responses = { ...LEGACY_RESPONSES, ...custodyResponses(SIX_PAIR_STATE, { 'DOC:0': HANDLERS['DOC:1'], 'DOC:1': HANDLERS['DOC:0'] }) }
     const lendingApi = createLegacyApi(block, { [block]: responses })
     await assert.rejects(createLendingTvl(fixtureManifest())(lendingApi), /manifest handler of pair DOC:0/)
     assert.equal(lendingApi.balances[USDT0.toLowerCase()], undefined)
@@ -512,24 +502,23 @@ test('accepts an on-chain handler address that differs from the manifest only in
   const readers = relaunchReaders(fixtureManifest())
 
   for (const category of ['idle', 'lending']) {
-    const api = createApi(block, { [block]: custodyResponses(SEVEN_PAIR_STATE, assigned) })
+    const api = createApi(block, { [block]: custodyResponses(SIX_PAIR_STATE, assigned) })
     await readers[category](api)
-    assert.deepEqual(api.balances, sumByToken(pick(SEVEN_PAIR_EXPECTED, CATEGORY_PAIRS[category])))
+    assert.deepEqual(api.balances, sumByToken(pick(SIX_PAIR_EXPECTED, CATEGORY_PAIRS[category])))
   }
 })
 
-test('accepts the fixture manifest and returns the seven handlers with their routes', () => {
+test('accepts the fixture manifest and returns the six handlers with their routes', () => {
   const deployment = validateRelaunchManifest(fixtureManifest())
 
   assert.equal(deployment.startBlock, START_BLOCK)
   assert.equal(deployment.protocolVersion, 'fixture-2')
   assert.equal(deployment.dcaManager, DCA_MANAGER)
   assert.equal(deployment.operationsAdmin, OPERATIONS_ADMIN)
-  // Each handler has exactly one category: route 0 is idle, routes 1 and 2 are lending.
+  // Each handler has exactly one category: route 0 is idle, route 1 is lending.
   assert.deepEqual(deployment.handlers.map(({ pair, protocol, category, handler, stablecoin, decimals }) => ({ pair, protocol, category, handler, stablecoin, decimals })), [
     { pair: 'DOC:0', protocol: 'idle', category: 'idle', handler: HANDLERS['DOC:0'], stablecoin: DOC, decimals: 18 },
     { pair: 'DOC:1', protocol: 'layerbank', category: 'lending', handler: HANDLERS['DOC:1'], stablecoin: DOC, decimals: 18 },
-    { pair: 'DOC:2', protocol: 'sovryn', category: 'lending', handler: HANDLERS['DOC:2'], stablecoin: DOC, decimals: 18 },
     { pair: 'USDRIF:0', protocol: 'idle', category: 'idle', handler: HANDLERS['USDRIF:0'], stablecoin: USDRIF, decimals: 18 },
     { pair: 'USDRIF:1', protocol: 'layerbank', category: 'lending', handler: HANDLERS['USDRIF:1'], stablecoin: USDRIF, decimals: 18 },
     { pair: 'USDT0:0', protocol: 'idle', category: 'idle', handler: HANDLERS['USDT0:0'], stablecoin: USDT0, decimals: 6 },
@@ -565,15 +554,14 @@ test('rejects defective manifests', async t => {
     ['an address without 0x', fixtureManifest({ dcaManager: DCA_MANAGER.slice(2) }), /dcaManager is not a valid address/],
     ['an address with a non-hex character', fixtureManifest({ dcaManager: `${DCA_MANAGER.slice(0, 41)}g` }), /dcaManager is not a valid address/],
     ['a numeric address', fixtureManifest({ operationsAdmin: 2 }), /operationsAdmin is not a valid address/],
-    ['a zero handler', fixtureManifest({ handlers: replaceHandler('USDT0:1', { handler: ZERO_ADDRESS }) }), /handlers\[6\]\.handler is the zero address/],
+    ['a zero handler', fixtureManifest({ handlers: replaceHandler('USDT0:1', { handler: ZERO_ADDRESS }) }), /handlers\[5\]\.handler is the zero address/],
     ['a structurally invalid handler', fixtureManifest({ handlers: replaceHandler('DOC:1', { handler: '0x1234' }) }), /handlers\[1\]\.handler is not a valid address/],
-    ['two pairs with one handler', fixtureManifest({ handlers: replaceHandler('USDRIF:0', { handler: HANDLERS['DOC:0'] }) }), /handlers\[3\]\.handler duplicates handlers\[0\]\.handler/],
+    ['two pairs with one handler', fixtureManifest({ handlers: replaceHandler('USDRIF:0', { handler: HANDLERS['DOC:0'] }) }), /handlers\[2\]\.handler duplicates handlers\[0\]\.handler/],
     ['a duplicate that differs only in letter case', fixtureManifest({ handlers: replaceHandler('USDRIF:0', { handler: HANDLERS['DOC:0'].toUpperCase().replace('0X', '0x') }) }), /duplicates handlers\[0\]\.handler/],
-    ['a handler equal to DcaManager', fixtureManifest({ handlers: replaceHandler('DOC:2', { handler: DCA_MANAGER }) }), /handlers\[2\]\.handler duplicates dcaManager/],
+    ['a handler equal to DcaManager', fixtureManifest({ handlers: replaceHandler('USDRIF:0', { handler: DCA_MANAGER }) }), /handlers\[2\]\.handler duplicates dcaManager/],
     ['OperationsAdmin equal to DcaManager', fixtureManifest({ operationsAdmin: DCA_MANAGER }), /operationsAdmin duplicates dcaManager/],
     ['a handler equal to a stablecoin', fixtureManifest({ handlers: replaceHandler('DOC:0', { handler: DOC }) }), /duplicates token DOC/],
     ['a handler equal to a LayerBank aToken', fixtureManifest({ handlers: replaceHandler('USDT0:1', { handler: TOKENS.USDT0.layerBankAToken }) }), /duplicates LayerBank aToken of USDT0/],
-    ['a handler equal to the Sovryn iToken', fixtureManifest({ handlers: replaceHandler('DOC:2', { handler: TOKENS.DOC.sovrynIToken }) }), /duplicates Sovryn iToken of DOC/],
     ['a handler equal to a legacy handler', fixtureManifest({ handlers: replaceHandler('DOC:1', { handler: LEGACY_ADDRESSES[0] }) }), /duplicates a legacy address/],
     ['DcaManager equal to a legacy receipt token', fixtureManifest({ dcaManager: LEGACY_ADDRESSES[1] }), /dcaManager duplicates a legacy address/],
     ['a wrong DOC token', fixtureManifest({ tokens: { DOC: USDRIF, USDRIF, USDT0 } }), /tokens\.DOC is the wrong token/],
@@ -583,21 +571,24 @@ test('rejects defective manifests', async t => {
     ['an extra token', fixtureManifest({ tokens: { DOC, USDRIF, USDT0, WRBTC } }), /tokens has unknown field WRBTC/],
     ['a handler for an unknown token', fixtureManifest({ handlers: replaceHandler('DOC:0', { token: 'WRBTC' }) }), /unknown token WRBTC/],
     ['a handler with an inherited object key as token', fixtureManifest({ handlers: replaceHandler('DOC:0', { token: 'constructor' }) }), /unknown token constructor/],
-    ['USDRIF on Sovryn', fixtureManifest({ handlers: replaceHandler('USDRIF:1', { routeIndex: 2 }) }), /unsupported pair USDRIF:2/],
-    ['USDT0 on Sovryn', fixtureManifest({ handlers: replaceHandler('USDT0:1', { routeIndex: 2 }) }), /unsupported pair USDT0:2/],
+    ['DOC on unused route index 2', fixtureManifest({ handlers: replaceHandler('DOC:1', { routeIndex: 2 }) }), /unsupported pair DOC:2/],
+    ['USDRIF on unused route index 2', fixtureManifest({ handlers: replaceHandler('USDRIF:1', { routeIndex: 2 }) }), /unsupported pair USDRIF:2/],
+    ['USDT0 on unused route index 2', fixtureManifest({ handlers: replaceHandler('USDT0:1', { routeIndex: 2 }) }), /unsupported pair USDT0:2/],
+    ['a seventh DOC handler on unused route index 2', fixtureManifest({ handlers: [...fixtureManifest().handlers, { token: 'DOC', routeIndex: 2, handler: fixtureAddress(0x0102) }] }), /handlers\[6\] has unsupported pair DOC:2/],
     ['route index 4', fixtureManifest({ handlers: replaceHandler('DOC:1', { routeIndex: 4 }) }), /unsupported pair DOC:4/],
     ['route index 3', fixtureManifest({ handlers: replaceHandler('DOC:1', { routeIndex: 3 }) }), /unsupported pair DOC:3/],
     ['a text route index', fixtureManifest({ handlers: replaceHandler('DOC:1', { routeIndex: '1' }) }), /unsupported pair DOC:1/],
     ['a repeated pair', fixtureManifest({ handlers: replaceHandler('DOC:1', { routeIndex: 0 }) }), /handlers\[1\] repeats pair DOC:0/],
     ['an extra handler field', fixtureManifest({ handlers: replaceHandler('DOC:0', { lendingToken: WRBTC }) }), /handlers\[0\] has unknown field lendingToken/],
     ['handlers that are not a list', fixtureManifest({ handlers: HANDLERS }), /handlers is not a list/],
-    ['six handlers without an explicit subset', fixtureManifest({ handlers: fixtureManifest().handlers.slice(0, 6) }), /handler for pair USDT0:1 is missing/],
+    ['five handlers without an explicit subset', fixtureManifest({ handlers: fixtureManifest().handlers.slice(0, 5) }), /handler for pair USDT0:1 is missing/],
     ['no handlers', fixtureManifest({ handlers: [] }), /handler for pair DOC:0 is missing/],
     ['an empty active subset', fixtureManifest({ activePairs: [] }), /activePairs must be a list with at least one pair/],
     ['an active subset that is not a list', fixtureManifest({ activePairs: 'DOC:0' }), /activePairs must be a list/],
     ['an unsupported pair in the active subset', fixtureManifest({ activePairs: ['USDRIF:2'] }), /activePairs has unsupported pair USDRIF:2/],
+    ['the unused route index 2 in the active subset', fixtureManifest({ activePairs: ['DOC:0', 'DOC:2'] }), /activePairs has unsupported pair DOC:2/],
     ['a repeated pair in the active subset', fixtureManifest({ activePairs: ['DOC:0', 'DOC:0'] }), /activePairs has a duplicate pair/],
-    ['a handler outside the active subset', fixtureManifest({ activePairs: ['DOC:0', 'DOC:1'] }), /handler for pair DOC:2 is not in activePairs/],
+    ['a handler outside the active subset', fixtureManifest({ activePairs: ['DOC:0', 'DOC:1'] }), /handler for pair USDRIF:0 is not in activePairs/],
     ['an active pair without a handler', fixtureManifest({ activePairs: SUPPORTED_PAIRS, handlers: fixtureManifest().handlers.slice(1) }), /handler for pair DOC:0 is missing/],
   ]
 
@@ -616,7 +607,7 @@ test('rejects defective manifests', async t => {
 test('reads only the handlers of an explicit active subset', async () => {
   const manifest = subsetManifest(['DOC:0', 'USDT0:1'])
   const block = START_BLOCK + 1
-  const responses = custodyResponses({ 'DOC:0': SEVEN_PAIR_STATE['DOC:0'], 'USDT0:1': SEVEN_PAIR_STATE['USDT0:1'] })
+  const responses = custodyResponses({ 'DOC:0': SIX_PAIR_STATE['DOC:0'], 'USDT0:1': SIX_PAIR_STATE['USDT0:1'] })
   const readers = relaunchReaders(manifest)
 
   const idleApi = createApi(block, { [block]: responses })
@@ -631,8 +622,8 @@ test('reads only the handlers of an explicit active subset', async () => {
       { params: [DOC, 0] },
       { params: [USDT0, 1] },
     ]])
-  assert.deepEqual(idleApi.balances, { [DOC.toLowerCase()]: SEVEN_PAIR_EXPECTED['DOC:0'] })
-  assert.deepEqual(lendingApi.balances, { [USDT0.toLowerCase()]: SEVEN_PAIR_EXPECTED['USDT0:1'] })
+  assert.deepEqual(idleApi.balances, { [DOC.toLowerCase()]: SIX_PAIR_EXPECTED['DOC:0'] })
+  assert.deepEqual(lendingApi.balances, { [USDT0.toLowerCase()]: SIX_PAIR_EXPECTED['USDT0:1'] })
 })
 
 test('a stablecoin spent in a purchase is not counted again as rBTC', async () => {
@@ -645,7 +636,7 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
   const mocHandler = HANDLERS['DOC:0']
   const dexHandler = HANDLERS['USDT0:1']
   const index = '1100000000000000000000000000'
-  const idleOthers = { 'DOC:1': { scaled: '0', index }, 'DOC:2': { shares: '0', price: '1000000000000000000' }, 'USDRIF:0': '0', 'USDRIF:1': { scaled: '0', index }, 'USDT0:0': '0' }
+  const idleOthers = { 'DOC:1': { scaled: '0', index }, 'USDRIF:0': '0', 'USDRIF:1': { scaled: '0', index }, 'USDT0:0': '0' }
   const states = [
     {
       name: 'before purchase',
@@ -722,7 +713,7 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
     const requested = new Set(api.calls.map(call => call.key))
     for (const key of Object.keys(rbtcResponses)) assert.equal(requested.has(key), false)
     for (const call of api.calls) {
-      assert.ok([ABI_BALANCE_OF, ABI_SCALED_BALANCE_OF, ABI_POOL, ABI_NORMALIZED_INCOME, ABI_TOKEN_PRICE].includes(call.abi))
+      assert.ok([ABI_BALANCE_OF, ABI_SCALED_BALANCE_OF, ABI_POOL, ABI_NORMALIZED_INCOME].includes(call.abi))
       assert.notEqual(call.target.toLowerCase(), WRBTC.toLowerCase())
       assert.equal(Object.values(HANDLERS).map(address => address.toLowerCase()).includes(call.target.toLowerCase()), false)
     }
@@ -741,9 +732,9 @@ test('a stablecoin spent in a purchase is not counted again as rBTC', async () =
 
 test('legacy and relaunch totals stay separate and add up in the compositions the two adapters use', async () => {
   const block = START_BLOCK + 10
-  const relaunchResponses = custodyResponses(SEVEN_PAIR_STATE)
-  const lendingExpected = sumByToken(pick(SEVEN_PAIR_EXPECTED, LENDING_PAIRS))
-  const idleExpected = sumByToken(pick(SEVEN_PAIR_EXPECTED, IDLE_PAIRS))
+  const relaunchResponses = custodyResponses(SIX_PAIR_STATE)
+  const lendingExpected = sumByToken(pick(SIX_PAIR_EXPECTED, LENDING_PAIRS))
+  const idleExpected = sumByToken(pick(SIX_PAIR_EXPECTED, IDLE_PAIRS))
 
   const legacyApi = createLegacyApi(block, { [block]: LEGACY_RESPONSES })
   await legacyTvl(legacyApi)
@@ -814,7 +805,7 @@ test('a relaunch reader needs an explicit category', () => {
 
 test('mixed totals: each handler is read by one adapter only, and the two adapters count each handler once', async () => {
   const block = START_BLOCK + 10
-  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE) } }
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SIX_PAIR_STATE) } }
   const manifest = fixtureManifest()
 
   const lendingApi = createLegacyApi(block, responses)
@@ -836,7 +827,7 @@ test('mixed totals: each handler is read by one adapter only, and the two adapte
   const lendingKeys = new Set(lendingApi.calls.map(call => call.key))
   for (const call of idleApi.calls) assert.equal(lendingKeys.has(call.key), false)
 
-  // One add per handler: three legacy and four relaunch lending adds, three relaunch idle adds.
+  // One add per handler: three legacy and three relaunch lending adds, three relaunch idle adds.
   assert.equal(lendingApi.adds.length, 3 + LENDING_PAIRS.length)
   assert.equal(idleApi.adds.length, IDLE_PAIRS.length)
 
@@ -844,7 +835,7 @@ test('mixed totals: each handler is read by one adapter only, and the two adapte
   const combined = {}
   for (const balances of [lendingApi.balances, idleApi.balances])
     for (const [token, amount] of Object.entries(balances)) combined[token] = (combined[token] ?? 0n) + amount
-  const relaunchOnce = sumByToken(SEVEN_PAIR_EXPECTED)
+  const relaunchOnce = sumByToken(SIX_PAIR_EXPECTED)
   assert.deepEqual(combined, {
     [DOC.toLowerCase()]: LEGACY_EXPECTED[DOC.toLowerCase()] + relaunchOnce[DOC.toLowerCase()],
     [USDRIF.toLowerCase()]: LEGACY_EXPECTED[USDRIF.toLowerCase()] + relaunchOnce[USDRIF.toLowerCase()],
@@ -858,7 +849,7 @@ test('mixed totals: each handler is read by one adapter only, and the two adapte
     [USDT0.toLowerCase()]: 2500000001n,
   })
   assert.deepEqual(lendingApi.balances, {
-    [DOC.toLowerCase()]: 15309347739976302686n + 1454252674737243840448n + 2100000000000000000000n + 3703703670370370367000n,
+    [DOC.toLowerCase()]: 15309347739976302686n + 1454252674737243840448n + 2100000000000000000000n,
     [USDRIF.toLowerCase()]: 16708418721585n + 10n,
     [USDT0.toLowerCase()]: 1000000000n,
   })
@@ -867,7 +858,7 @@ test('mixed totals: each handler is read by one adapter only, and the two adapte
 test('an idle-only manifest gives the lending adapter the legacy result alone', async () => {
   const manifest = subsetManifest(IDLE_PAIRS)
   const block = START_BLOCK + 10
-  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SEVEN_PAIR_STATE, IDLE_PAIRS)) } }
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SIX_PAIR_STATE, IDLE_PAIRS)) } }
 
   // No relaunch lending handler: the relaunch lending reader never uses the API.
   await createRelaunchTvl(manifest, 'lending')(untouchableApi())
@@ -882,13 +873,13 @@ test('an idle-only manifest gives the lending adapter the legacy result alone', 
   await createIdleTvl(manifest)(idleApi)
   assert.equal(idleApi.calls.length, IDLE_PAIRS.length)
   assert.deepEqual(idleApi.multiCalls.map(({ calls }) => calls), [assignmentCalls(IDLE_PAIRS)])
-  assert.deepEqual(idleApi.balances, sumByToken(pick(SEVEN_PAIR_EXPECTED, IDLE_PAIRS)))
+  assert.deepEqual(idleApi.balances, sumByToken(pick(SIX_PAIR_EXPECTED, IDLE_PAIRS)))
 })
 
 test('a lending-only manifest gives an idle adapter that never uses the API', async () => {
   const manifest = subsetManifest(LENDING_PAIRS)
   const block = START_BLOCK + 10
-  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SEVEN_PAIR_STATE, LENDING_PAIRS)) } }
+  const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(pick(SIX_PAIR_STATE, LENDING_PAIRS)) } }
 
   await createIdleTvl(manifest)(untouchableApi())
   await createRelaunchTvl(manifest, 'idle')(untouchableApi())
@@ -897,7 +888,7 @@ test('a lending-only manifest gives an idle adapter that never uses the API', as
   await createLendingTvl(manifest)(lendingApi)
   assert.equal(lendingApi.calls.length, 6 + CATEGORY_CALLS.lending)
   assert.deepEqual(lendingApi.multiCalls.map(({ calls }) => calls), [assignmentCalls(LENDING_PAIRS)])
-  const lendingExpected = sumByToken(pick(SEVEN_PAIR_EXPECTED, LENDING_PAIRS))
+  const lendingExpected = sumByToken(pick(SIX_PAIR_EXPECTED, LENDING_PAIRS))
   assert.deepEqual(lendingApi.balances, {
     [DOC.toLowerCase()]: LEGACY_EXPECTED[DOC.toLowerCase()] + lendingExpected[DOC.toLowerCase()],
     [USDRIF.toLowerCase()]: LEGACY_EXPECTED[USDRIF.toLowerCase()] + lendingExpected[USDRIF.toLowerCase()],
@@ -906,6 +897,7 @@ test('a lending-only manifest gives an idle adapter that never uses the API', as
 })
 
 test('the DOC-only and six-pair launch subsets are split between the adapters with no Sovryn read', async t => {
+  const [, , legacySovrynHandler, legacySovrynIToken] = LEGACY_ADDRESSES
   const subsets = [
     ['DOC-only', ['DOC:0', 'DOC:1'], { idle: { DOC: 1000000000000000000001n }, lending: { DOC: 2100000000000000000000n } }],
     ['six-pair', ['DOC:0', 'DOC:1', 'USDRIF:0', 'USDRIF:1', 'USDT0:0', 'USDT0:1'], {
@@ -918,7 +910,7 @@ test('the DOC-only and six-pair launch subsets are split between the adapters wi
     await t.test(name, async () => {
       const manifest = subsetManifest(pairs)
       const block = START_BLOCK + 10
-      const responses = { [block]: custodyResponses(pick(SEVEN_PAIR_STATE, pairs)) }
+      const responses = { [block]: custodyResponses(pick(SIX_PAIR_STATE, pairs)) }
 
       const apis = { idle: createApi(block, responses), lending: createApi(block, responses) }
       await createIdleTvl(manifest)(apis.idle)
@@ -931,7 +923,9 @@ test('the DOC-only and six-pair launch subsets are split between the adapters wi
         // Idle: one read per handler. LayerBank: three reads per handler.
         assert.equal(api.calls.length, (category === 'idle' ? 1 : 3) * categoryPairs.length)
         assert.deepEqual(api.multiCalls.map(({ calls }) => calls), [assignmentCalls(pairs)])
-        assert.equal(api.calls.some(call => call.target.toLowerCase() === TOKENS.DOC.sovrynIToken.toLowerCase()), false)
+        // The relaunch readers never address a legacy Sovryn contract.
+        for (const address of [legacySovrynHandler, legacySovrynIToken])
+          assert.equal(api.calls.some(call => call.target.toLowerCase() === address.toLowerCase() || String(call.params?.[0]).toLowerCase() === address.toLowerCase()), false)
         assert.deepEqual(api.balances, byKey(expected[category]))
       }
     })
@@ -942,7 +936,7 @@ test('historical blocks: before the start block the lending adapter is legacy on
   const manifest = fixtureManifest()
   // Fixture values at each block. Only the block numbers are historical.
   for (const block of [9200000, 9294353, START_BLOCK - 1]) {
-    const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SEVEN_PAIR_STATE) } }
+    const responses = { [block]: { ...LEGACY_RESPONSES, ...custodyResponses(SIX_PAIR_STATE) } }
 
     const lendingApi = createLegacyApi(block, responses)
     await createLendingTvl(manifest)(lendingApi)
@@ -957,4 +951,55 @@ test('historical blocks: before the start block the lending adapter is legacy on
     assert.deepEqual(idleApi.multiCalls, [])
     assert.deepEqual(idleApi.balances, {})
   }
+})
+
+test('the relaunch catalog has no Sovryn route: route index 2 is unused and never counted', async () => {
+  assert.equal(SUPPORTED_PAIRS.some(pair => pair.endsWith(':2')), false)
+  for (const token of Object.values(TOKENS)) {
+    assert.equal(token.routes.includes(2), false)
+    assert.equal(Object.hasOwn(token, 'sovrynIToken'), false)
+  }
+
+  // The manifest of the six launch handlers validates without an explicit subset.
+  const deployment = validateRelaunchManifest(fixtureManifest())
+  assert.deepEqual(deployment.handlers.map(({ pair }) => pair), SUPPORTED_PAIRS)
+  assert.deepEqual(deployment.handlers.map(({ protocol }) => protocol).filter(protocol => protocol !== 'idle' && protocol !== 'layerbank'), [])
+
+  // The methodology claims no relaunch Sovryn handler. Legacy Sovryn custody is still described and read.
+  assert.match(adapter.methodology, /The relaunch has no Sovryn handler\./)
+  assert.doesNotMatch(adapter.methodology, /Sovryn handlers count/)
+  assert.doesNotMatch(adapter.methodology, /tokenPrice/)
+  assert.doesNotMatch(idleAdapter.methodology, /Sovryn/)
+  const block = 9294353
+  const legacyApi = createLegacyApi(block, { [block]: LEGACY_RESPONSES })
+  await legacyTvl(legacyApi)
+  assert.equal(legacyApi.balances[DOC.toLowerCase()], LEGACY_EXPECTED[DOC.toLowerCase()])
+})
+
+test('a LayerBank receipt token moved out of a relaunch lending handler lowers TVL', async () => {
+  // A share withdrawal (R119) transfers the handler's aTokens to the user. The reader counts the
+  // handler's own scaled aToken balance, so the position leaves TVL with the tokens. Idle cash is unaffected.
+  const index = '1050000000000000000000000001'
+  const block = START_BLOCK + 50
+  const read = async (scaled) => {
+    const state = { 'DOC:0': '500000000000000000000', 'DOC:1': { scaled, index }, 'USDRIF:0': '0', 'USDRIF:1': { scaled: '0', index }, 'USDT0:0': '0', 'USDT0:1': { scaled: '0', index } }
+    const responses = { [block]: custodyResponses(state) }
+    const lendingApi = createApi(block, responses)
+    await createRelaunchTvl(fixtureManifest(), 'lending')(lendingApi)
+    const idleApi = createApi(block, responses)
+    await createIdleTvl(fixtureManifest())(idleApi)
+    return { lending: lendingApi.balances[DOC.toLowerCase()], idle: idleApi.balances[DOC.toLowerCase()] }
+  }
+
+  const before = await read('2000000000000000000000')
+  const partial = await read('1000000000000000000000') // half of the shares left the handler
+  const after = await read('1') // remainder of one scaled share stays booked
+
+  assert.equal(before.lending, 2000000000000000000000n * 1050000000000000000000000001n / RAY)
+  assert.equal(partial.lending, 1000000000000000000000n * 1050000000000000000000000001n / RAY)
+  assert.equal(after.lending, 1n)
+  assert.ok(before.lending > partial.lending && partial.lending > after.lending)
+  assert.equal(before.idle, 500000000000000000000n)
+  assert.equal(partial.idle, before.idle)
+  assert.equal(after.idle, before.idle)
 })

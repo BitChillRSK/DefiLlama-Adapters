@@ -15,14 +15,17 @@ const { legacyTvl, LEGACY_ADDRESSES } = require('./legacy')
 //   operationsAdmin: '0x...',
 //   tokens: { DOC: '0x...', USDRIF: '0x...', USDT0: '0x...' },
 //   handlers: [{ token: 'DOC', routeIndex: 0, handler: '0x...' }, ...],
-//   activePairs: ['DOC:0', ...],    // optional: an explicit subset of the seven pairs
+//   activePairs: ['DOC:0', ...],    // optional: an explicit subset of the six pairs
 // }
 const RELAUNCH_MANIFEST = null
 
 const RSK_CHAIN_ID = 30
 
 // Route indexes of the relaunch map. Index 1 is LayerBank here (it was Tropykus in legacy).
+// Index 2 stays unused on the relaunch stack (R120: Sovryn is a test-only legacy adapter, outside
+// the audit and deployment scope), so it has no entry and is never reused for another venue.
 // Indexes 3 and 4 are not available.
+// The legacy Sovryn handler is still counted by legacy.js.
 //
 // Each route has one accounting category. DefiLlama applies `doublecounted` to a whole
 // adapter, so each category has its own adapter: idle cash is in `bitchill-idle` (not
@@ -31,7 +34,6 @@ const RSK_CHAIN_ID = 30
 const ROUTES = {
   0: { protocol: 'idle', category: 'idle' },
   1: { protocol: 'layerbank', category: 'lending' },
-  2: { protocol: 'sovryn', category: 'lending' },
 }
 const CATEGORIES = ['idle', 'lending']
 
@@ -41,9 +43,8 @@ const TOKENS = {
   DOC: {
     address: '0xe700691dA7b9851F2F35f8b8182c69c53CcaD9Db',
     decimals: 18,
-    routes: [0, 1, 2],
+    routes: [0, 1],
     layerBankAToken: '0x3F04280C66314b78E9712A41BF8C1A214460cAa2', // lRooDOC
-    sovrynIToken: '0xd8D25f03EBbA94E15Df2eD4d6D38276B595593c1', // iDOC
   },
   USDRIF: {
     address: '0x3A15461d8aE0F0Fb5Fa2629e9DA7D66A794a6e37',
@@ -63,14 +64,12 @@ const SUPPORTED_PAIRS = Object.entries(TOKENS)
   .flatMap(([symbol, { routes }]) => routes.map(routeIndex => `${symbol}:${routeIndex}`))
 
 const LAYERBANK_RATE_SCALE = 10n ** 27n // Aave liquidity index (RAY)
-const SOVRYN_RATE_SCALE = 10n ** 18n
 
 const ABI = {
   balanceOf: 'erc20:balanceOf',
   scaledBalanceOf: 'function scaledBalanceOf(address) view returns (uint256)',
   pool: 'address:POOL',
   getReserveNormalizedIncome: 'function getReserveNormalizedIncome(address) view returns (uint256)',
-  tokenPrice: 'uint256:tokenPrice',
   getHandler: 'function getHandler(address token, uint256 routeIndex) view returns (address)',
 }
 
@@ -161,7 +160,6 @@ function validateRelaunchManifest(manifest) {
       stablecoin: token.address,
       decimals: token.decimals,
       layerBankAToken: token.layerBankAToken,
-      sovrynIToken: token.sovrynIToken,
     })
   })
 
@@ -176,7 +174,6 @@ function validateRelaunchManifest(manifest) {
   for (const [symbol, token] of Object.entries(TOKENS)) {
     taken.set(token.address.toLowerCase(), `token ${symbol}`)
     taken.set(token.layerBankAToken.toLowerCase(), `LayerBank aToken of ${symbol}`)
-    if (token.sovrynIToken) taken.set(token.sovrynIToken.toLowerCase(), `Sovryn iToken of ${symbol}`)
   }
   for (const [label, address] of bitchillAddresses) {
     const key = address.toLowerCase()
@@ -222,7 +219,7 @@ async function requireAssignedHandlers(api, { operationsAdmin, handlers }) {
 
 // Underlying stablecoin of one handler. Each handler type has one source of value, so a
 // receipt token and its underlying are never added together.
-async function handlerUnderlying(api, { protocol, handler, stablecoin, layerBankAToken, sovrynIToken }) {
+async function handlerUnderlying(api, { protocol, handler, stablecoin, layerBankAToken }) {
   if (protocol === 'idle')
     return BigInt(await api.call({ target: stablecoin, abi: ABI.balanceOf, params: [handler] }))
 
@@ -233,14 +230,6 @@ async function handlerUnderlying(api, { protocol, handler, stablecoin, layerBank
     ])
     const liquidityIndex = await api.call({ target: pool, abi: ABI.getReserveNormalizedIncome, params: [stablecoin] })
     return BigInt(scaledBalance) * BigInt(liquidityIndex) / LAYERBANK_RATE_SCALE
-  }
-
-  if (protocol === 'sovryn') {
-    const [shares, tokenPrice] = await Promise.all([
-      api.call({ target: sovrynIToken, abi: ABI.balanceOf, params: [handler] }),
-      api.call({ target: sovrynIToken, abi: ABI.tokenPrice }),
-    ])
-    return BigInt(shares) * BigInt(tokenPrice) / SOVRYN_RATE_SCALE
   }
 
   throw new Error(`Unknown relaunch route: ${protocol}`)
